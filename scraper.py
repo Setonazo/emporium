@@ -88,6 +88,37 @@ async def _first_visible(page, selectors: list) -> Optional[object]:
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 
+async def _dismiss_cookie_banner(page):
+    """Dismiss Usercentrics and other common cookie consent banners."""
+    try:
+        # Usercentrics uses shadow DOM
+        dismissed = await page.evaluate("""() => {
+            const uc = document.querySelector('#usercentrics-root');
+            if (uc && uc.shadowRoot) {
+                const btn = uc.shadowRoot.querySelector(
+                    '[data-testid="uc-accept-all-button"], button[class*="accept"]'
+                );
+                if (btn) { btn.click(); return true; }
+            }
+            return false;
+        }""")
+        if dismissed:
+            logger.info("Usercentrics cookie banner dismissed")
+            await page.wait_for_timeout(500)
+            return
+    except Exception:
+        pass
+
+    # Fallback: hide the overlay entirely
+    try:
+        await page.evaluate("""() => {
+            const el = document.querySelector('#usercentrics-root, #cookie-banner, .cookie-consent');
+            if (el) el.style.display = 'none';
+        }""")
+    except Exception:
+        pass
+
+
 async def _do_login(page) -> bool:
     if not DUFRY_EMAIL or not DUFRY_PASSWORD:
         logger.error("DUFRY_EMAIL / DUFRY_PASSWORD not configured")
@@ -97,6 +128,9 @@ async def _do_login(page) -> bool:
         logger.info("Navigating to SSO login: %s", page.url)
         await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
         logger.info("SSO page loaded. Title: %s", await page.title())
+
+        # Dismiss cookie consent banner before interacting with the form
+        await _dismiss_cookie_banner(page)
 
         # --- Step 1: fill email (find first VISIBLE text/email input) ---
         email_el = await _first_visible(page, [
@@ -123,6 +157,7 @@ async def _do_login(page) -> bool:
                 await page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:
                 pass
+            await _dismiss_cookie_banner(page)
 
         # --- Step 2: fill password (wait for visible password field) ---
         try:
@@ -138,7 +173,8 @@ async def _do_login(page) -> bool:
         await pass_el.fill(DUFRY_PASSWORD)
         logger.info("Password filled")
 
-        # Final submit
+        # Final submit — dismiss cookie banner first to unblock the button
+        await _dismiss_cookie_banner(page)
         submit_btn = await _first_visible(page, ["button[type='submit']"])
         if submit_btn:
             await submit_btn.click()
