@@ -52,8 +52,6 @@ _IN_STOCK_TEXT = [
 ]
 
 
-# ── Session helpers ───────────────────────────────────────────────────────────
-
 async def _save_cookies(ctx):
     cookies = await ctx.cookies()
     COOKIES_FILE.write_text(json.dumps(cookies))
@@ -73,7 +71,10 @@ async def _load_cookies(ctx) -> bool:
 
 
 def _needs_login(url: str) -> bool:
-    return any(kw in url for kw in ("sso.clubavolta.com", "login", "signin"))
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    base = p.netloc + p.path  # domain + path only, ignore query params
+    return any(kw in base for kw in ("sso.clubavolta.com", "/login", "/signin"))
 
 
 async def _first_visible(page, selectors: list) -> Optional[object]:
@@ -86,12 +87,9 @@ async def _first_visible(page, selectors: list) -> Optional[object]:
     return None
 
 
-# ── Login ─────────────────────────────────────────────────────────────────────
-
 async def _dismiss_cookie_banner(page):
     """Dismiss Usercentrics and other common cookie consent banners."""
     try:
-        # Usercentrics uses shadow DOM
         dismissed = await page.evaluate("""() => {
             const uc = document.querySelector('#usercentrics-root');
             if (uc && uc.shadowRoot) {
@@ -109,7 +107,6 @@ async def _dismiss_cookie_banner(page):
     except Exception:
         pass
 
-    # Fallback: hide the overlay entirely
     try:
         await page.evaluate("""() => {
             const el = document.querySelector('#usercentrics-root, #cookie-banner, .cookie-consent');
@@ -129,10 +126,8 @@ async def _do_login(page) -> bool:
         await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
         logger.info("SSO page loaded. Title: %s", await page.title())
 
-        # Dismiss cookie consent banner before interacting with the form
         await _dismiss_cookie_banner(page)
 
-        # --- Step 1: fill email (find first VISIBLE text/email input) ---
         email_el = await _first_visible(page, [
             "input[type='email']",
             "input[name='email']",
@@ -148,7 +143,6 @@ async def _do_login(page) -> bool:
         await email_el.fill(DUFRY_EMAIL)
         logger.info("Email filled")
 
-        # Some SSO pages are two-step: submit email first, then password appears
         submit_btn = await _first_visible(page, ["button[type='submit']"])
         if submit_btn:
             await submit_btn.click()
@@ -159,7 +153,6 @@ async def _do_login(page) -> bool:
                 pass
             await _dismiss_cookie_banner(page)
 
-        # --- Step 2: fill password (wait for visible password field) ---
         try:
             await page.wait_for_selector("input[type='password']", state="visible", timeout=10_000)
         except Exception:
@@ -173,7 +166,6 @@ async def _do_login(page) -> bool:
         await pass_el.fill(DUFRY_PASSWORD)
         logger.info("Password filled")
 
-        # Final submit — dismiss cookie banner first to unblock the button
         await _dismiss_cookie_banner(page)
         submit_btn = await _first_visible(page, ["button[type='submit']"])
         if submit_btn:
@@ -195,8 +187,6 @@ async def _do_login(page) -> bool:
         logger.error("Login failed: %s", exc)
         return False
 
-
-# ── Stock checker ─────────────────────────────────────────────────────────────
 
 async def check_stock(url: str, custom_selector: str = None) -> StockResult:
     try:
@@ -230,7 +220,6 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
 
             logger.info("Page loaded. URL: %s | Title: %s", page.url, await page.title())
 
-            # Login if needed
             if _needs_login(page.url):
                 logger.info("Login required")
                 ok = await _do_login(page)
@@ -245,7 +234,6 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                 except PWTimeout:
                     pass
 
-            # Product name
             name: Optional[str] = None
             for sel in _NAME_SELECTORS:
                 el = await page.query_selector(sel)
@@ -256,7 +244,6 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                         break
             logger.info("Product name: %s", name)
 
-            # Custom selector
             if custom_selector:
                 el = await page.query_selector(custom_selector)
                 if el is not None:
@@ -268,14 +255,12 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                         name=name,
                     )
 
-            # Explicit OOS elements
             for sel in _OOS_SELECTORS:
                 if await page.query_selector(sel):
                     logger.info("OOS selector: %s", sel)
                     await browser.close()
                     return StockResult(in_stock=False, name=name)
 
-            # Add-to-cart button
             btn = await page.query_selector(_ADD_TO_CART)
             if btn is not None:
                 disabled = await btn.get_attribute("disabled")
@@ -285,7 +270,6 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                 await browser.close()
                 return StockResult(in_stock=in_stock, name=name)
 
-            # Text fallback
             try:
                 body = (await page.inner_text("body")).lower()
             except Exception:
