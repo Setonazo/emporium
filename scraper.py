@@ -11,7 +11,15 @@ DUFRY_EMAIL = os.getenv("DUFRY_EMAIL")
 DUFRY_PASSWORD = os.getenv("DUFRY_PASSWORD")
 COOKIES_FILE = Path(os.getenv("COOKIES_FILE", "/tmp/dufry_session.json"))
 
-# ── Result type ───────────────────────────────────────────────────────────────
+SSO_LOGIN_URL = (
+    "https://sso.clubavolta.com/login"
+    "?response_type=code"
+    "&redirect_uri=https://esfnf.emporium.dufry.com/sso/redirect"
+    "&client_id=jozu6c3hqypeq"
+    "&scope=openid+email"
+    "&privacy_url=null"
+    "&lang=es"
+)
 
 @dataclass
 class StockResult:
@@ -19,25 +27,19 @@ class StockResult:
     name: Optional[str]
     error: Optional[str] = field(default=None)
 
-
-# ── CSS selectors ─────────────────────────────────────────────────────────────
-
 _NAME_SELECTORS = [
     "h1.cx-heading", "h1.product-name", ".pdp-summary__name",
     ".product-details__name", ".product__title", "h1",
 ]
-
 _ADD_TO_CART = ", ".join([
     "cx-add-to-cart button", "button.btn-add-to-cart",
     "button[data-testid*='add-to-cart']", "button[data-action*='addToCart']",
     "button[id*='addToCart']", ".add-to-cart button", "button.addToCart",
 ])
-
 _OOS_SELECTORS = [
     ".cx-out-of-stock", ".out-of-stock", "[class*='outOfStock']",
     "[class*='out-of-stock']", "[data-stock='false']",
 ]
-
 _OOS_TEXT = [
     "out of stock", "sin stock", "agotado", "no disponible",
     "sold out", "sin existencias", "not available",
@@ -47,8 +49,6 @@ _IN_STOCK_TEXT = [
     "agregar al carrito", "comprar ahora", "buy now",
 ]
 
-
-# ── Session helpers ───────────────────────────────────────────────────────────
 
 async def _save_cookies(ctx):
     cookies = await ctx.cookies()
@@ -68,87 +68,66 @@ async def _load_cookies(ctx) -> bool:
         return False
 
 
-async def _has_login_form(page) -> bool:
-    """Returns True if the current page has a password input field."""
-    el = await page.query_selector("input[type='password']")
-    return el is not None
+def _needs_login(url: str) -> bool:
+    return any(kw in url for kw in (
+        "sso.clubavolta.com", "login", "signin", "sign-in",
+    ))
 
 
-# ── Login ─────────────────────────────────────────────────────────────────────
-
-async def _do_login(page, target_url: str) -> bool:
-    """
-    Fills the login form on the current page (if present),
-    or navigates to the login page first.
-    """
+async def _fill_login_form(page) -> bool:
+    """Fill and submit the login form on the current page."""
     if not DUFRY_EMAIL or not DUFRY_PASSWORD:
-        logger.warning("DUFRY_EMAIL / DUFRY_PASSWORD not configured")
+        logger.error("DUFRY_EMAIL / DUFRY_PASSWORD not set in environment")
         return False
 
     try:
-        # If there's no login form on current page, go to the login page
-        if not await _has_login_form(page):
-            base = target_url.split("/es/")[0] if "/es/" in target_url else "https://esfnf.emporium.dufry.com"
-            for login_path in ("/es/login", "/login", "/es/my-account/login"):
-                try:
-                    await page.goto(f"{base}{login_path}", wait_until="networkidle", timeout=20_000)
-                    if await _has_login_form(page):
-                        logger.info("Login form found at %s%s", base, login_path)
-                        break
-                except Exception:
-                    continue
-            else:
-                logger.error("Could not find login form on any known URL")
-                return False
+        logger.info("Filling login form at: %s", page.url)
 
-        logger.info("Filling login form on: %s", page.url)
+        # Wait for the form to appear
+        await page.wait_for_selector("input[type='password']", timeout=10_000)
 
-        # Fill email — try by type first (most reliable), then by common names
-        email_el = await page.query_selector("input[type='email']")
-        if not email_el:
-            for sel in ("input[formcontrolname='userId']", "input[formcontrolname='email']",
-                        "input[name='email']", "input[name='j_username']", "#email", "#userId"):
-                email_el = await page.query_selector(sel)
-                if email_el:
-                    break
-        if not email_el:
-            # Last resort: first visible text input
-            email_el = await page.query_selector("input[type='text']")
+        # Email/username — try several selectors
+        email_el = None
+        for sel in (
+            "input[type='email']",
+            "input[name='email']", "input[name='username']",
+            "input[name='identifier']", "input[id='email']",
+            "input[id='username']", "input[type='text']",
+        ):
+            email_el = await page.query_selector(sel)
+            if email_el:
+                logger.info("Email field found: %s", sel)
+                break
 
         if not email_el:
-            logger.error("Email/username field not found")
+            logger.error("Email field not found. Page title: %s", await page.title())
             return False
 
         await email_el.fill(DUFRY_EMAIL)
-        logger.info("Email field filled")
 
-        # Fill password
+        # Password
         pass_el = await page.query_selector("input[type='password']")
         if not pass_el:
             logger.error("Password field not found")
             return False
 
         await pass_el.fill(DUFRY_PASSWORD)
-        logger.info("Password field filled")
 
         # Submit
         submit_el = await page.query_selector("button[type='submit']")
         if submit_el:
             await submit_el.click()
-            logger.info("Clicked submit button")
         else:
             await pass_el.press("Enter")
-            logger.info("Pressed Enter to submit")
 
         await page.wait_for_load_state("networkidle", timeout=20_000)
-        logger.info("After login, URL is: %s", page.url)
+        logger.info("After login submit, URL: %s", page.url)
 
-        # Login failed if password field still visible
-        if await _has_login_form(page):
-            logger.warning("Password field still visible after submit — wrong credentials?")
+        # Still on login page = wrong credentials
+        if _needs_login(page.url):
+            logger.warning("Still on login page after submit — check credentials")
             return False
 
-        logger.info("Login successful")
         return True
 
     except Exception as exc:
@@ -156,7 +135,17 @@ async def _do_login(page, target_url: str) -> bool:
         return False
 
 
-# ── Main scraper ──────────────────────────────────────────────────────────────
+async def _login(page, product_url: str) -> bool:
+    """Navigate to SSO login if needed and authenticate."""
+    # Go directly to SSO login URL (preserves the redirect_uri back to Dufry)
+    from playwright.async_api import TimeoutError as PWTimeout
+    try:
+        await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
+    except PWTimeout:
+        pass
+
+    return await _fill_login_form(page)
+
 
 async def check_stock(url: str, custom_selector: str = None) -> StockResult:
     try:
@@ -180,38 +169,34 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
             page = await ctx.new_page()
             await _load_cookies(ctx)
 
+            # Load the product page
             try:
                 await page.goto(url, wait_until="networkidle", timeout=30_000)
             except PWTimeout:
-                logger.warning("networkidle timeout for %s — continuing", url)
+                logger.warning("networkidle timeout — continuing")
             except Exception as exc:
                 await browser.close()
                 return StockResult(in_stock=None, name=None,
                     error=f"Error de red: {str(exc)[:120]}")
 
-            logger.info("Loaded page: %s (URL now: %s)", url, page.url)
+            logger.info("Page loaded. URL: %s | Title: %s", page.url, await page.title())
 
-            # Detect login requirement: login form present OR URL contains auth keywords
-            needs_login = await _has_login_form(page) or any(
-                kw in page.url.lower() for kw in ("login", "signin", "sign-in", "my-account/auth")
-            )
-
-            if needs_login:
-                logger.info("Login required, attempting...")
-                logged_in = await _do_login(page, url)
-                if not logged_in:
+            # Login if redirected to SSO or login page
+            if _needs_login(page.url):
+                logger.info("Login required (URL: %s)", page.url)
+                ok = await _login(page, url)
+                if not ok:
                     await browser.close()
                     return StockResult(in_stock=None, name=None,
-                        error="Login fallido. Verifica DUFRY_EMAIL y DUFRY_PASSWORD, y revisa los logs de Railway.")
+                        error="Login fallido. Revisa DUFRY_EMAIL y DUFRY_PASSWORD y los logs de Railway.")
                 await _save_cookies(ctx)
-                # Navigate back to product after login
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=30_000)
-                    logger.info("Returned to product page after login")
+                    logger.info("Back on product page: %s", page.url)
                 except PWTimeout:
                     pass
 
-            # ── Product name ─────────────────────────────────────────────────
+            # Product name
             name: Optional[str] = None
             for sel in _NAME_SELECTORS:
                 el = await page.query_selector(sel)
@@ -220,36 +205,38 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                     if text:
                         name = text
                         break
-            logger.info("Product name detected: %s", name)
+            logger.info("Product name: %s", name)
 
-            # ── Custom selector ──────────────────────────────────────────────
+            # Custom selector
             if custom_selector:
                 el = await page.query_selector(custom_selector)
                 if el is not None:
                     disabled = await el.get_attribute("disabled")
                     cls = (await el.get_attribute("class")) or ""
-                    in_stock = disabled is None and "disabled" not in cls
                     await browser.close()
-                    return StockResult(in_stock=in_stock, name=name)
+                    return StockResult(
+                        in_stock=disabled is None and "disabled" not in cls,
+                        name=name,
+                    )
 
-            # ── Explicit OOS elements ────────────────────────────────────────
+            # Explicit OOS elements
             for sel in _OOS_SELECTORS:
                 if await page.query_selector(sel):
                     logger.info("OOS selector matched: %s", sel)
                     await browser.close()
                     return StockResult(in_stock=False, name=name)
 
-            # ── Add-to-cart button state ─────────────────────────────────────
+            # Add-to-cart button state
             btn = await page.query_selector(_ADD_TO_CART)
             if btn is not None:
                 disabled = await btn.get_attribute("disabled")
                 cls = (await btn.get_attribute("class")) or ""
                 in_stock = disabled is None and "disabled" not in cls
-                logger.info("Add-to-cart button found, disabled=%s, classes=%s", disabled, cls)
+                logger.info("Cart button found — in_stock=%s cls=%s", in_stock, cls)
                 await browser.close()
                 return StockResult(in_stock=in_stock, name=name)
 
-            # ── Text-based fallback ──────────────────────────────────────────
+            # Text fallback
             try:
                 body = (await page.inner_text("body")).lower()
             except Exception:
@@ -257,24 +244,20 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
 
             for kw in _OOS_TEXT:
                 if kw in body:
-                    logger.info("OOS text matched: %s", kw)
                     await browser.close()
                     return StockResult(in_stock=False, name=name)
             for kw in _IN_STOCK_TEXT:
                 if kw in body:
-                    logger.info("In-stock text matched: %s", kw)
                     await browser.close()
                     return StockResult(in_stock=True, name=name)
 
-            # Log a snippet to help diagnose selector issues
-            logger.warning("Could not detect stock. Page title: %s | Body snippet: %.200s",
-                           await page.title(), body[:200])
-
+            logger.warning("Stock undetected. Title=%s | Body[:300]=%s",
+                           await page.title(), body[:300])
             await browser.close()
             return StockResult(in_stock=None, name=name,
-                error="No se pudo detectar el estado del stock automaticamente")
+                error="No se pudo detectar stock automaticamente")
 
     except Exception as exc:
-        logger.exception("Unexpected scraper error for %s", url)
+        logger.exception("Unexpected error for %s", url)
         return StockResult(in_stock=None, name=None,
             error=f"Error inesperado: {str(exc)[:120]}")
