@@ -21,11 +21,13 @@ SSO_LOGIN_URL = (
     "&lang=es"
 )
 
+
 @dataclass
 class StockResult:
     in_stock: Optional[bool]
     name: Optional[str]
     error: Optional[str] = field(default=None)
+
 
 _NAME_SELECTORS = [
     "h1.cx-heading", "h1.product-name", ".pdp-summary__name",
@@ -50,6 +52,8 @@ _IN_STOCK_TEXT = [
 ]
 
 
+# ── Session helpers ───────────────────────────────────────────────────────────
+
 async def _save_cookies(ctx):
     cookies = await ctx.cookies()
     COOKIES_FILE.write_text(json.dumps(cookies))
@@ -69,90 +73,100 @@ async def _load_cookies(ctx) -> bool:
 
 
 def _needs_login(url: str) -> bool:
-    return any(kw in url for kw in (
-        "sso.clubavolta.com", "login", "signin", "sign-in",
-    ))
+    return any(kw in url for kw in ("sso.clubavolta.com", "login", "signin"))
 
 
-async def _fill_login_form(page) -> bool:
-    """Fill and submit the login form on the current page."""
+async def _first_visible(page, selectors: list) -> Optional[object]:
+    """Return the first visible element matching any of the given selectors."""
+    for sel in selectors:
+        els = await page.query_selector_all(sel)
+        for el in els:
+            if await el.is_visible():
+                return el
+    return None
+
+
+# ── Login ─────────────────────────────────────────────────────────────────────
+
+async def _do_login(page) -> bool:
     if not DUFRY_EMAIL or not DUFRY_PASSWORD:
-        logger.error("DUFRY_EMAIL / DUFRY_PASSWORD not set in environment")
+        logger.error("DUFRY_EMAIL / DUFRY_PASSWORD not configured")
         return False
 
     try:
-        logger.info("Filling login form at: %s", page.url)
+        logger.info("Navigating to SSO login: %s", page.url)
+        await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
+        logger.info("SSO page loaded. Title: %s", await page.title())
 
-        # Wait for the form to appear
-        await page.wait_for_selector("input[type='password']", timeout=10_000)
-
-        # Email/username — try several selectors
-        email_el = None
-        for sel in (
+        # --- Step 1: fill email (find first VISIBLE text/email input) ---
+        email_el = await _first_visible(page, [
             "input[type='email']",
-            "input[name='email']", "input[name='username']",
-            "input[name='identifier']", "input[id='email']",
-            "input[id='username']", "input[type='text']",
-        ):
-            email_el = await page.query_selector(sel)
-            if email_el:
-                logger.info("Email field found: %s", sel)
-                break
+            "input[name='email']",
+            "input[name='username']",
+            "input[name='identifier']",
+            "input[type='text']",
+        ])
 
         if not email_el:
-            logger.error("Email field not found. Page title: %s", await page.title())
+            logger.error("No visible email/text input found on SSO page")
             return False
 
         await email_el.fill(DUFRY_EMAIL)
+        logger.info("Email filled")
 
-        # Password
-        pass_el = await page.query_selector("input[type='password']")
+        # Some SSO pages are two-step: submit email first, then password appears
+        submit_btn = await _first_visible(page, ["button[type='submit']"])
+        if submit_btn:
+            await submit_btn.click()
+            logger.info("Clicked submit (may be two-step)")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+
+        # --- Step 2: fill password (wait for visible password field) ---
+        try:
+            await page.wait_for_selector("input[type='password']", state="visible", timeout=10_000)
+        except Exception:
+            logger.warning("Password field did not become visible in 10s")
+
+        pass_el = await _first_visible(page, ["input[type='password']"])
         if not pass_el:
-            logger.error("Password field not found")
+            logger.error("No visible password field found")
             return False
 
         await pass_el.fill(DUFRY_PASSWORD)
+        logger.info("Password filled")
 
-        # Submit
-        submit_el = await page.query_selector("button[type='submit']")
-        if submit_el:
-            await submit_el.click()
+        # Final submit
+        submit_btn = await _first_visible(page, ["button[type='submit']"])
+        if submit_btn:
+            await submit_btn.click()
         else:
             await pass_el.press("Enter")
 
         await page.wait_for_load_state("networkidle", timeout=20_000)
-        logger.info("After login submit, URL: %s", page.url)
+        logger.info("Post-login URL: %s", page.url)
 
-        # Still on login page = wrong credentials
         if _needs_login(page.url):
-            logger.warning("Still on login page after submit — check credentials")
+            logger.warning("Still on login page — credentials may be wrong")
             return False
 
+        logger.info("Login successful")
         return True
 
     except Exception as exc:
-        logger.error("Login error: %s", exc)
+        logger.error("Login failed: %s", exc)
         return False
 
 
-async def _login(page, product_url: str) -> bool:
-    """Navigate to SSO login if needed and authenticate."""
-    # Go directly to SSO login URL (preserves the redirect_uri back to Dufry)
-    from playwright.async_api import TimeoutError as PWTimeout
-    try:
-        await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
-    except PWTimeout:
-        pass
-
-    return await _fill_login_form(page)
-
+# ── Stock checker ─────────────────────────────────────────────────────────────
 
 async def check_stock(url: str, custom_selector: str = None) -> StockResult:
     try:
         from playwright.async_api import async_playwright, TimeoutError as PWTimeout
     except ImportError:
-        return StockResult(in_stock=None, name=None,
-            error="Playwright no instalado.")
+        return StockResult(in_stock=None, name=None, error="Playwright no instalado.")
 
     try:
         async with async_playwright() as pw:
@@ -169,7 +183,6 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
             page = await ctx.new_page()
             await _load_cookies(ctx)
 
-            # Load the product page
             try:
                 await page.goto(url, wait_until="networkidle", timeout=30_000)
             except PWTimeout:
@@ -181,14 +194,14 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
 
             logger.info("Page loaded. URL: %s | Title: %s", page.url, await page.title())
 
-            # Login if redirected to SSO or login page
+            # Login if needed
             if _needs_login(page.url):
-                logger.info("Login required (URL: %s)", page.url)
-                ok = await _login(page, url)
+                logger.info("Login required")
+                ok = await _do_login(page)
                 if not ok:
                     await browser.close()
                     return StockResult(in_stock=None, name=None,
-                        error="Login fallido. Revisa DUFRY_EMAIL y DUFRY_PASSWORD y los logs de Railway.")
+                        error="Login fallido. Revisa DUFRY_EMAIL y DUFRY_PASSWORD.")
                 await _save_cookies(ctx)
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=30_000)
@@ -222,17 +235,17 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
             # Explicit OOS elements
             for sel in _OOS_SELECTORS:
                 if await page.query_selector(sel):
-                    logger.info("OOS selector matched: %s", sel)
+                    logger.info("OOS selector: %s", sel)
                     await browser.close()
                     return StockResult(in_stock=False, name=name)
 
-            # Add-to-cart button state
+            # Add-to-cart button
             btn = await page.query_selector(_ADD_TO_CART)
             if btn is not None:
                 disabled = await btn.get_attribute("disabled")
                 cls = (await btn.get_attribute("class")) or ""
                 in_stock = disabled is None and "disabled" not in cls
-                logger.info("Cart button found — in_stock=%s cls=%s", in_stock, cls)
+                logger.info("Cart button: disabled=%s cls=%s", disabled, cls)
                 await browser.close()
                 return StockResult(in_stock=in_stock, name=name)
 
