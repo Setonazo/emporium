@@ -242,6 +242,10 @@ def _base_url(product_url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
+_ACTION_BUTTON_KEYWORDS = ["añadir", "agregar", "add to cart", "add to bag", "comprar",
+                           "avís", "avisame", "avísame", "notif", "avisa"]
+
+
 async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
     """
     Finds the action button and checks whether it is 'add to cart' or
@@ -251,13 +255,21 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
     """
     await _dismiss_cookie_banner(page)
 
-    # Wait for the SPA to render the product action area
+    # Wait until the SPA renders the actual product action button (not nav buttons)
+    logger.info("Waiting for product action button to render...")
     try:
-        await page.wait_for_selector("button", state="visible", timeout=10_000)
+        await page.wait_for_function(
+            """(kws) => Array.from(document.querySelectorAll('button')).some(
+                btn => kws.some(kw => (btn.innerText || '').toLowerCase().includes(kw))
+            )""",
+            _ACTION_BUTTON_KEYWORDS,
+            timeout=15_000,
+        )
+        logger.info("Action button appeared in DOM")
     except Exception:
-        pass
+        logger.warning("Action button not found within 15s — checking OOS text")
 
-    # Early OOS check via page text (before touching any buttons)
+    # OOS check via page text (covers "producto agotado" page state)
     try:
         body_pre = (await page.inner_text("body")).lower()
     except Exception:
@@ -305,7 +317,7 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
         logger.info("Add-to-cart button is disabled — out of stock")
         return False
 
-    # Click and verify
+    # Click and wait for the cart popup to actually appear in the DOM
     logger.info("Clicking add-to-cart to verify actual stock...")
     try:
         await add_btn.click()
@@ -313,10 +325,22 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
         logger.warning("Click failed: %s", exc)
         return None
 
+    logger.info("Waiting for cart result popup...")
     try:
-        await page.wait_for_load_state("networkidle", timeout=12_000)
+        await page.wait_for_function(
+            """(data) => {
+                const body = (document.body.innerText || '').toLowerCase();
+                return data.success.some(k => body.includes(k))
+                    || data.oos.some(k => body.includes(k))
+                    || data.sel.some(s => !!document.querySelector(s));
+            }""",
+            {"success": _CART_SUCCESS_TEXTS, "oos": _OOS_AFTER_CLICK, "sel": _CART_CONFIRMED_SELECTORS},
+            timeout=15_000,
+        )
+        logger.info("Cart result appeared in DOM")
     except Exception:
-        await page.wait_for_timeout(4_000)
+        logger.warning("Cart result did not appear within 15s")
+        await page.wait_for_timeout(2_000)
 
     await _dismiss_cookie_banner(page)
 
