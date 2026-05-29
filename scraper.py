@@ -21,6 +21,24 @@ SSO_LOGIN_URL = (
     "&lang=es"
 )
 
+# Button texts that mean "out of stock — notify me"
+_NOTIFY_TEXTS = ["notif", "avís", "alert", "back in stock", "avisa"]
+# Button texts that mean "add to cart"
+_ADD_TEXTS = ["añadir", "agregar", "add to cart", "add to bag", "comprar"]
+
+# Selectors for the cart confirmation dialog (Spartacus)
+_CART_CONFIRMED_SELECTORS = [
+    "cx-added-to-cart-dialog",
+    "[class*='AddedToCart']",
+    "[class*='added-to-cart']",
+    ".cx-dialog-title",
+]
+# Error texts that appear after a failed add-to-cart
+_OOS_AFTER_CLICK = [
+    "out of stock", "sin stock", "agotado", "no hay stock",
+    "not available", "no disponible", "unavailable",
+]
+
 
 @dataclass
 class StockResult:
@@ -33,24 +51,9 @@ _NAME_SELECTORS = [
     "h1.cx-heading", "h1.product-name", ".pdp-summary__name",
     ".product-details__name", ".product__title", "h1",
 ]
-_ADD_TO_CART = ", ".join([
-    "cx-add-to-cart button", "button.btn-add-to-cart",
-    "button[data-testid*='add-to-cart']", "button[data-action*='addToCart']",
-    "button[id*='addToCart']", ".add-to-cart button", "button.addToCart",
-])
-_OOS_SELECTORS = [
-    ".cx-out-of-stock", ".out-of-stock", "[class*='outOfStock']",
-    "[class*='out-of-stock']", "[data-stock='false']",
-]
-_OOS_TEXT = [
-    "out of stock", "sin stock", "agotado", "no disponible",
-    "sold out", "sin existencias", "not available",
-]
-_IN_STOCK_TEXT = [
-    "in stock", "en stock", "add to cart", "anadir al carrito",
-    "agregar al carrito", "comprar ahora", "buy now",
-]
 
+
+# ── Session helpers ───────────────────────────────────────────────────────────
 
 async def _save_cookies(ctx):
     cookies = await ctx.cookies()
@@ -73,12 +76,11 @@ async def _load_cookies(ctx) -> bool:
 def _needs_login(url: str) -> bool:
     from urllib.parse import urlparse
     p = urlparse(url)
-    base = p.netloc + p.path  # domain + path only, ignore query params
+    base = p.netloc + p.path
     return any(kw in base for kw in ("sso.clubavolta.com", "/login", "/signin"))
 
 
 async def _first_visible(page, selectors: list) -> Optional[object]:
-    """Return the first visible element matching any of the given selectors."""
     for sel in selectors:
         els = await page.query_selector_all(sel)
         for el in els:
@@ -87,8 +89,9 @@ async def _first_visible(page, selectors: list) -> Optional[object]:
     return None
 
 
+# ── Cookie banner ─────────────────────────────────────────────────────────────
+
 async def _dismiss_cookie_banner(page):
-    """Dismiss Usercentrics and other common cookie consent banners."""
     try:
         dismissed = await page.evaluate("""() => {
             const uc = document.querySelector('#usercentrics-root');
@@ -101,12 +104,11 @@ async def _dismiss_cookie_banner(page):
             return false;
         }""")
         if dismissed:
-            logger.info("Usercentrics cookie banner dismissed")
+            logger.info("Cookie banner dismissed")
             await page.wait_for_timeout(500)
             return
     except Exception:
         pass
-
     try:
         await page.evaluate("""() => {
             const el = document.querySelector('#usercentrics-root, #cookie-banner, .cookie-consent');
@@ -116,28 +118,25 @@ async def _dismiss_cookie_banner(page):
         pass
 
 
+# ── Login ─────────────────────────────────────────────────────────────────────
+
 async def _do_login(page) -> bool:
     if not DUFRY_EMAIL or not DUFRY_PASSWORD:
         logger.error("DUFRY_EMAIL / DUFRY_PASSWORD not configured")
         return False
 
     try:
-        logger.info("Navigating to SSO login: %s", page.url)
         await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
         logger.info("SSO page loaded. Title: %s", await page.title())
-
         await _dismiss_cookie_banner(page)
 
         email_el = await _first_visible(page, [
-            "input[type='email']",
-            "input[name='email']",
-            "input[name='username']",
-            "input[name='identifier']",
+            "input[type='email']", "input[name='email']",
+            "input[name='username']", "input[name='identifier']",
             "input[type='text']",
         ])
-
         if not email_el:
-            logger.error("No visible email/text input found on SSO page")
+            logger.error("No visible email field on SSO page")
             return False
 
         await email_el.fill(DUFRY_EMAIL)
@@ -146,7 +145,7 @@ async def _do_login(page) -> bool:
         submit_btn = await _first_visible(page, ["button[type='submit']"])
         if submit_btn:
             await submit_btn.click()
-            logger.info("Clicked submit (may be two-step)")
+            logger.info("Clicked submit (two-step)")
             try:
                 await page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:
@@ -156,11 +155,11 @@ async def _do_login(page) -> bool:
         try:
             await page.wait_for_selector("input[type='password']", state="visible", timeout=10_000)
         except Exception:
-            logger.warning("Password field did not become visible in 10s")
+            logger.warning("Password field slow to appear")
 
         pass_el = await _first_visible(page, ["input[type='password']"])
         if not pass_el:
-            logger.error("No visible password field found")
+            logger.error("No visible password field")
             return False
 
         await pass_el.fill(DUFRY_PASSWORD)
@@ -177,7 +176,7 @@ async def _do_login(page) -> bool:
         logger.info("Post-login URL: %s", page.url)
 
         if _needs_login(page.url):
-            logger.warning("Still on login page — credentials may be wrong")
+            logger.warning("Still on login page after submit")
             return False
 
         logger.info("Login successful")
@@ -187,6 +186,119 @@ async def _do_login(page) -> bool:
         logger.error("Login failed: %s", exc)
         return False
 
+
+# ── Cart helpers ──────────────────────────────────────────────────────────────
+
+async def _remove_from_cart(page, base_url: str):
+    """Navigate to cart page and remove all items to clean up."""
+    try:
+        cart_url = base_url.rstrip("/") + "/es/cart"
+        await page.goto(cart_url, wait_until="networkidle", timeout=20_000)
+        await _dismiss_cookie_banner(page)
+
+        removed = 0
+        for _ in range(10):  # remove up to 10 items
+            btn = await _first_visible(page, [
+                "button[aria-label*='Remove']",
+                "button[aria-label*='Eliminar']",
+                ".cx-remove-btn",
+                "[class*='remove-item']",
+                "button[class*='Remove']",
+            ])
+            if not btn:
+                break
+            await btn.click()
+            await page.wait_for_timeout(800)
+            removed += 1
+
+        logger.info("Removed %d item(s) from cart", removed)
+    except Exception as exc:
+        logger.warning("Cart cleanup failed (non-critical): %s", exc)
+
+
+# ── Stock verification by actually clicking ───────────────────────────────────
+
+async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
+    """
+    Finds the action button and checks whether it is 'add to cart' or
+    'notify me'. If it is 'add to cart', clicks it and checks whether
+    the item was actually added (verifying real availability).
+    Cleans up the cart afterwards.
+    """
+    await _dismiss_cookie_banner(page)
+
+    buttons = await page.query_selector_all("button")
+    add_btn = None
+    notify_btn = None
+
+    for btn in buttons:
+        if not await btn.is_visible():
+            continue
+        text = (await btn.inner_text()).lower().strip()
+        cls = ((await btn.get_attribute("class")) or "").lower()
+
+        if any(kw in text for kw in _NOTIFY_TEXTS):
+            notify_btn = btn
+            logger.info("Notify-me button found: '%s'", text[:60])
+        elif any(kw in text or kw in cls for kw in _ADD_TEXTS):
+            add_btn = btn
+            logger.info("Add-to-cart button found: '%s'", text[:60])
+
+    # Notify-me present without add-to-cart → definitely out of stock
+    if notify_btn and not add_btn:
+        logger.info("Only notify-me button visible — out of stock")
+        return False
+
+    if not add_btn:
+        logger.warning("No action button found")
+        return None
+
+    # Check if the add-to-cart button is disabled
+    disabled = await add_btn.get_attribute("disabled")
+    cls = (await add_btn.get_attribute("class")) or ""
+    if disabled is not None or "disabled" in cls:
+        logger.info("Add-to-cart button is disabled — out of stock")
+        return False
+
+    # Click and verify
+    logger.info("Clicking add-to-cart to verify actual stock...")
+    try:
+        await add_btn.click()
+    except Exception as exc:
+        logger.warning("Click failed: %s", exc)
+        return None
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8_000)
+    except Exception:
+        await page.wait_for_timeout(2_000)
+
+    await _dismiss_cookie_banner(page)
+
+    # Check for cart confirmation dialog
+    for sel in _CART_CONFIRMED_SELECTORS:
+        if await page.query_selector(sel):
+            logger.info("Cart confirmation dialog found (%s) — IN STOCK", sel)
+            base = product_url.split("/es/")[0] if "/es/" in product_url else "https://esfnf.emporium.dufry.com"
+            await _remove_from_cart(page, base)
+            return True
+
+    # Check for OOS error message that appeared after click
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+
+    for kw in _OOS_AFTER_CLICK:
+        if kw in body:
+            logger.info("OOS error after clicking add-to-cart: '%s'", kw)
+            return False
+
+    logger.warning("Add-to-cart result unclear after click")
+    return None
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 async def check_stock(url: str, custom_selector: str = None) -> StockResult:
     try:
@@ -220,6 +332,7 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
 
             logger.info("Page loaded. URL: %s | Title: %s", page.url, await page.title())
 
+            # Login if needed
             if _needs_login(page.url):
                 logger.info("Login required")
                 ok = await _do_login(page)
@@ -234,6 +347,7 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                 except PWTimeout:
                     pass
 
+            # Product name
             name: Optional[str] = None
             for sel in _NAME_SELECTORS:
                 el = await page.query_selector(sel)
@@ -244,6 +358,7 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                         break
             logger.info("Product name: %s", name)
 
+            # Custom selector (manual override)
             if custom_selector:
                 el = await page.query_selector(custom_selector)
                 if el is not None:
@@ -255,40 +370,16 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                         name=name,
                     )
 
-            for sel in _OOS_SELECTORS:
-                if await page.query_selector(sel):
-                    logger.info("OOS selector: %s", sel)
-                    await browser.close()
-                    return StockResult(in_stock=False, name=name)
+            # Primary: verify by actually clicking add-to-cart
+            in_stock = await _verify_stock_by_clicking(page, url)
 
-            btn = await page.query_selector(_ADD_TO_CART)
-            if btn is not None:
-                disabled = await btn.get_attribute("disabled")
-                cls = (await btn.get_attribute("class")) or ""
-                in_stock = disabled is None and "disabled" not in cls
-                logger.info("Cart button: disabled=%s cls=%s", disabled, cls)
-                await browser.close()
+            await browser.close()
+
+            if in_stock is not None:
                 return StockResult(in_stock=in_stock, name=name)
 
-            try:
-                body = (await page.inner_text("body")).lower()
-            except Exception:
-                body = ""
-
-            for kw in _OOS_TEXT:
-                if kw in body:
-                    await browser.close()
-                    return StockResult(in_stock=False, name=name)
-            for kw in _IN_STOCK_TEXT:
-                if kw in body:
-                    await browser.close()
-                    return StockResult(in_stock=True, name=name)
-
-            logger.warning("Stock undetected. Title=%s | Body[:300]=%s",
-                           await page.title(), body[:300])
-            await browser.close()
             return StockResult(in_stock=None, name=name,
-                error="No se pudo detectar stock automaticamente")
+                error="No se pudo verificar el stock (botón de acción no encontrado)")
 
     except Exception as exc:
         logger.exception("Unexpected error for %s", url)
