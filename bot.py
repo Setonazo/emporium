@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", "15")) * 60
 
+# Prevents overlapping scheduled check cycles
+_scheduled_check_running = False
+
 
 def _stock_icon(val) -> str:
     if val == 1:
@@ -58,7 +62,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Uso: `/add <url>`\n\n"
             "Ejemplo:\n"
-            "`/add https://esfnf.emporium.dufry.com/es/product/whisky-johnnie-walker`",
+            "`/add <https://esfnf.emporium.dufry.com/es/product/whisky-johnnie-walker`>",
             parse_mode="Markdown",
         )
         return
@@ -174,41 +178,55 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = result.name or r["name"] or "Producto"
         note = f" — _{result.error}_" if result.error else ""
         lines.append(f"{_stock_icon(result.in_stock)} *{name}*{note}")
+        await asyncio.sleep(2)
 
     await msg.edit_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
-    rows = get_all_products()
-    logger.info("Scheduled check: %d product(s)", len(rows))
+    global _scheduled_check_running
+    if _scheduled_check_running:
+        logger.info("Skipping scheduled check — previous cycle still running")
+        return
 
-    for r in rows:
-        try:
-            result = await check_stock(r["url"], r["selector"])
-        except Exception as exc:
-            logger.error("Error checking product %d: %s", r["id"], exc)
-            continue
+    _scheduled_check_running = True
+    try:
+        rows = get_all_products()
+        logger.info("Scheduled check: %d product(s)", len(rows))
 
-        if result.in_stock is None:
-            continue
-
-        prev = r["in_stock"]
-        update_stock(r["id"], result.in_stock, result.name)
-
-        if result.in_stock and prev != 1:
-            name = result.name or r["name"] or "Producto"
+        for r in rows:
             try:
-                await context.bot.send_message(
-                    chat_id=r["chat_id"],
-                    text=(
-                        f"🔔 *¡Disponible!*\n\n"
-                        f"*{name}*\n\n"
-                        f"🛒 [Ver producto]({r['url']})"
-                    ),
-                    parse_mode="Markdown",
-                )
+                result = await check_stock(r["url"], r["selector"])
             except Exception as exc:
-                logger.error("Failed to notify chat %d: %s", r["chat_id"], exc)
+                logger.error("Error checking product %d: %s", r["id"], exc)
+                await asyncio.sleep(3)
+                continue
+
+            if result.in_stock is None:
+                await asyncio.sleep(2)
+                continue
+
+            prev = r["in_stock"]
+            update_stock(r["id"], result.in_stock, result.name)
+
+            if result.in_stock and prev != 1:
+                name = result.name or r["name"] or "Producto"
+                try:
+                    await context.bot.send_message(
+                        chat_id=r["chat_id"],
+                        text=(
+                            f"🔔 *¡Disponible!*\n\n"
+                            f"*{name}*\n\n"
+                            f"🛒 [Ver producto]({r['url']})"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception as exc:
+                    logger.error("Failed to notify chat %d: %s", r["chat_id"], exc)
+
+            await asyncio.sleep(2)
+    finally:
+        _scheduled_check_running = False
 
 
 def main():
