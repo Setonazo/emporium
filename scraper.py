@@ -1,9 +1,13 @@
+import asyncio
 import json
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# Only one Chromium instance at a time — prevents EAGAIN on resource-limited hosts
+_browser_semaphore = asyncio.Semaphore(1)
 
 logger = logging.getLogger(__name__)
 
@@ -12,9 +16,9 @@ DUFRY_PASSWORD = os.getenv("DUFRY_PASSWORD")
 COOKIES_FILE = Path(os.getenv("COOKIES_FILE", "/tmp/dufry_session.json"))
 
 SSO_LOGIN_URL = (
-    "https://sso.clubavolta.com/login"
+    "<https://sso.clubavolta.com/login>"
     "?response_type=code"
-    "&redirect_uri=https://esfnf.emporium.dufry.com/sso/redirect"
+    "&redirect_uri=<https://esfnf.emporium.dufry.com/sso/redirect>"
     "&client_id=jozu6c3hqypeq"
     "&scope=openid+email"
     "&privacy_url=null"
@@ -66,7 +70,7 @@ class StockResult:
 
 
 _NAME_SELECTORS = [
-    "h1.cx-heading", "h1.product-name", ".pdp-summary__name",
+    "<h1.cx>-heading", "h1.product-name", ".pdp-summary__name",
     ".product-details__name", ".product__title", "h1",
 ]
 
@@ -76,7 +80,7 @@ _NAME_SELECTORS = [
 async def _save_cookies(ctx):
     cookies = await ctx.cookies()
     COOKIES_FILE.write_text(json.dumps(cookies))
-    logger.info("Session saved (%d cookies)", len(cookies))
+    <logger.info>("Session saved (%d cookies)", len(cookies))
 
 
 async def _load_cookies(ctx) -> bool:
@@ -85,7 +89,7 @@ async def _load_cookies(ctx) -> bool:
     try:
         cookies = json.loads(COOKIES_FILE.read_text())
         await ctx.add_cookies(cookies)
-        logger.info("Session loaded (%d cookies)", len(cookies))
+        <logger.info>("Session loaded (%d cookies)", len(cookies))
         return True
     except Exception:
         return False
@@ -95,7 +99,7 @@ def _needs_login(url: str) -> bool:
     from urllib.parse import urlparse
     p = urlparse(url)
     base = p.netloc + p.path
-    return any(kw in base for kw in ("sso.clubavolta.com", "/login", "/signin"))
+    return any(kw in base for kw in ("<sso.clubavolta.com>", "/login", "/signin"))
 
 
 async def _first_visible(page, selectors: list) -> Optional[object]:
@@ -122,7 +126,7 @@ async def _dismiss_cookie_banner(page):
             return false;
         }""")
         if dismissed:
-            logger.info("Cookie banner dismissed")
+            <logger.info>("Cookie banner dismissed")
             await page.wait_for_timeout(500)
             return
     except Exception:
@@ -145,7 +149,7 @@ async def _do_login(page) -> bool:
 
     try:
         await page.goto(SSO_LOGIN_URL, wait_until="networkidle", timeout=30_000)
-        logger.info("SSO page loaded. Title: %s", await page.title())
+        <logger.info>("SSO page loaded. Title: %s", await page.title())
         await _dismiss_cookie_banner(page)
 
         email_el = await _first_visible(page, [
@@ -158,12 +162,12 @@ async def _do_login(page) -> bool:
             return False
 
         await email_el.fill(DUFRY_EMAIL)
-        logger.info("Email filled")
+        <logger.info>("Email filled")
 
         submit_btn = await _first_visible(page, ["button[type='submit']"])
         if submit_btn:
             await submit_btn.click()
-            logger.info("Clicked submit (two-step)")
+            <logger.info>("Clicked submit (two-step)")
             try:
                 await page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:
@@ -181,7 +185,7 @@ async def _do_login(page) -> bool:
             return False
 
         await pass_el.fill(DUFRY_PASSWORD)
-        logger.info("Password filled")
+        <logger.info>("Password filled")
 
         await _dismiss_cookie_banner(page)
         submit_btn = await _first_visible(page, ["button[type='submit']"])
@@ -191,13 +195,13 @@ async def _do_login(page) -> bool:
             await pass_el.press("Enter")
 
         await page.wait_for_load_state("networkidle", timeout=20_000)
-        logger.info("Post-login URL: %s", page.url)
+        <logger.info>("Post-login URL: %s", page.url)
 
         if _needs_login(page.url):
             logger.warning("Still on login page after submit")
             return False
 
-        logger.info("Login successful")
+        <logger.info>("Login successful")
         return True
 
     except Exception as exc:
@@ -229,7 +233,7 @@ async def _remove_from_cart(page, base_url: str):
             await page.wait_for_timeout(800)
             removed += 1
 
-        logger.info("Removed %d item(s) from cart", removed)
+        <logger.info>("Removed %d item(s) from cart", removed)
     except Exception as exc:
         logger.warning("Cart cleanup failed (non-critical): %s", exc)
 
@@ -256,7 +260,7 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
     await _dismiss_cookie_banner(page)
 
     # Wait until the SPA renders the actual product action button (not nav buttons)
-    logger.info("Waiting for product action button to render...")
+    <logger.info>("Waiting for product action button to render...")
     try:
         await page.wait_for_function(
             """(kws) => Array.from(document.querySelectorAll('button')).some(
@@ -265,7 +269,7 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
             _ACTION_BUTTON_KEYWORDS,
             timeout=15_000,
         )
-        logger.info("Action button appeared in DOM")
+        <logger.info>("Action button appeared in DOM")
     except Exception:
         logger.warning("Action button not found within 15s — checking OOS text")
 
@@ -276,7 +280,7 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
         body_pre = ""
     for kw in _OOS_PAGE_TEXTS:
         if kw in body_pre:
-            logger.info("Page-level OOS indicator found: '%s' — out of stock", kw)
+            <logger.info>("Page-level OOS indicator found: '%s' — out of stock", kw)
             return False
 
     buttons = await page.query_selector_all("button")
@@ -294,16 +298,16 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
 
         if any(kw in text for kw in _NOTIFY_TEXTS):
             notify_btn = btn
-            logger.info("Notify-me button found: '%s'", text[:60])
+            <logger.info>("Notify-me button found: '%s'", text[:60])
         elif any(kw in text or kw in cls for kw in _ADD_TEXTS):
             add_btn = btn
-            logger.info("Add-to-cart button found: '%s'", text[:60])
+            <logger.info>("Add-to-cart button found: '%s'", text[:60])
 
-    logger.info("Visible buttons on page: %s", visible_texts[:15])
+    <logger.info>("Visible buttons on page: %s", visible_texts[:15])
 
     # Notify-me present without add-to-cart → definitely out of stock
     if notify_btn and not add_btn:
-        logger.info("Only notify-me button visible — out of stock")
+        <logger.info>("Only notify-me button visible — out of stock")
         return False
 
     if not add_btn:
@@ -314,18 +318,18 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
     disabled = await add_btn.get_attribute("disabled")
     cls = (await add_btn.get_attribute("class")) or ""
     if disabled is not None or "disabled" in cls:
-        logger.info("Add-to-cart button is disabled — out of stock")
+        <logger.info>("Add-to-cart button is disabled — out of stock")
         return False
 
     # Click and wait for the cart popup to actually appear in the DOM
-    logger.info("Clicking add-to-cart to verify actual stock...")
+    <logger.info>("Clicking add-to-cart to verify actual stock...")
     try:
         await add_btn.click()
     except Exception as exc:
         logger.warning("Click failed: %s", exc)
         return None
 
-    logger.info("Waiting for cart result popup...")
+    <logger.info>("Waiting for cart result popup...")
     try:
         await page.wait_for_function(
             """(data) => {
@@ -337,7 +341,7 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
             {"success": _CART_SUCCESS_TEXTS, "oos": _OOS_AFTER_CLICK, "sel": _CART_CONFIRMED_SELECTORS},
             timeout=15_000,
         )
-        logger.info("Cart result appeared in DOM")
+        <logger.info>("Cart result appeared in DOM")
     except Exception:
         logger.warning("Cart result did not appear within 15s")
         await page.wait_for_timeout(2_000)
@@ -347,7 +351,7 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
     # Check for cart confirmation dialog (Spartacus component selectors)
     for sel in _CART_CONFIRMED_SELECTORS:
         if await page.query_selector(sel):
-            logger.info("Cart confirmation dialog found (%s) — IN STOCK", sel)
+            <logger.info>("Cart confirmation dialog found (%s) — IN STOCK", sel)
             await _remove_from_cart(page, _base_url(product_url))
             return True
 
@@ -359,13 +363,13 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
 
     for kw in _CART_SUCCESS_TEXTS:
         if kw in body:
-            logger.info("Cart success text found: '%s' — IN STOCK", kw)
+            <logger.info>("Cart success text found: '%s' — IN STOCK", kw)
             await _remove_from_cart(page, _base_url(product_url))
             return True
 
     for kw in _OOS_AFTER_CLICK:
         if kw in body:
-            logger.info("OOS error after clicking add-to-cart: '%s'", kw)
+            <logger.info>("OOS error after clicking add-to-cart: '%s'", kw)
             return False
 
     logger.warning("Add-to-cart result unclear after click")
@@ -380,82 +384,92 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
     except ImportError:
         return StockResult(in_stock=None, name=None, error="Playwright no instalado.")
 
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                locale="es-ES",
-                timezone_id="Europe/Madrid",
-            )
-            page = await ctx.new_page()
-            await _load_cookies(ctx)
+    async with _browser_semaphore:
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--no-zygote",
+                        "--single-process",
+                    ],
+                )
+                ctx = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="es-ES",
+                    timezone_id="Europe/Madrid",
+                )
+                page = await ctx.new_page()
+                await _load_cookies(ctx)
 
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=30_000)
-            except PWTimeout:
-                logger.warning("networkidle timeout — continuing")
-            except Exception as exc:
-                await browser.close()
-                return StockResult(in_stock=None, name=None,
-                    error=f"Error de red: {str(exc)[:120]}")
-
-            logger.info("Page loaded. URL: %s | Title: %s", page.url, await page.title())
-
-            # Login if needed
-            if _needs_login(page.url):
-                logger.info("Login required")
-                ok = await _do_login(page)
-                if not ok:
-                    await browser.close()
-                    return StockResult(in_stock=None, name=None,
-                        error="Login fallido. Revisa DUFRY_EMAIL y DUFRY_PASSWORD.")
-                await _save_cookies(ctx)
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=30_000)
-                    logger.info("Back on product page: %s", page.url)
                 except PWTimeout:
-                    pass
-
-            # Product name
-            name: Optional[str] = None
-            for sel in _NAME_SELECTORS:
-                el = await page.query_selector(sel)
-                if el:
-                    text = (await el.inner_text()).strip()[:120]
-                    if text:
-                        name = text
-                        break
-            logger.info("Product name: %s", name)
-
-            # Custom selector (manual override)
-            if custom_selector:
-                el = await page.query_selector(custom_selector)
-                if el is not None:
-                    disabled = await el.get_attribute("disabled")
-                    cls = (await el.get_attribute("class")) or ""
+                    logger.warning("networkidle timeout — continuing")
+                except Exception as exc:
                     await browser.close()
-                    return StockResult(
-                        in_stock=disabled is None and "disabled" not in cls,
-                        name=name,
-                    )
+                    return StockResult(in_stock=None, name=None,
+                        error=f"Error de red: {str(exc)[:120]}")
 
-            # Primary: verify by actually clicking add-to-cart
-            in_stock = await _verify_stock_by_clicking(page, url)
+                <logger.info>("Page loaded. URL: %s | Title: %s", page.url, await page.title())
 
-            await browser.close()
+                # Login if needed
+                if _needs_login(page.url):
+                    <logger.info>("Login required")
+                    ok = await _do_login(page)
+                    if not ok:
+                        await browser.close()
+                        return StockResult(in_stock=None, name=None,
+                            error="Login fallido. Revisa DUFRY_EMAIL y DUFRY_PASSWORD.")
+                    await _save_cookies(ctx)
+                    try:
+                        await page.goto(url, wait_until="networkidle", timeout=30_000)
+                        <logger.info>("Back on product page: %s", page.url)
+                    except PWTimeout:
+                        pass
 
-            if in_stock is not None:
-                return StockResult(in_stock=in_stock, name=name)
+                # Product name
+                name: Optional[str] = None
+                for sel in _NAME_SELECTORS:
+                    el = await page.query_selector(sel)
+                    if el:
+                        text = (await el.inner_text()).strip()[:120]
+                        if text:
+                            name = text
+                            break
+                <logger.info>("Product name: %s", name)
 
-            return StockResult(in_stock=None, name=name,
-                error="No se pudo verificar el stock (botón de acción no encontrado)")
+                # Custom selector (manual override)
+                if custom_selector:
+                    el = await page.query_selector(custom_selector)
+                    if el is not None:
+                        disabled = await el.get_attribute("disabled")
+                        cls = (await el.get_attribute("class")) or ""
+                        await browser.close()
+                        return StockResult(
+                            in_stock=disabled is None and "disabled" not in cls,
+                            name=name,
+                        )
 
-    except Exception as exc:
-        logger.exception("Unexpected error for %s", url)
-        return StockResult(in_stock=None, name=None,
-            error=f"Error inesperado: {str(exc)[:120]}")
+                # Primary: verify by actually clicking add-to-cart
+                in_stock = await _verify_stock_by_clicking(page, url)
+
+                await browser.close()
+
+                if in_stock is not None:
+                    return StockResult(in_stock=in_stock, name=name)
+
+                return StockResult(in_stock=None, name=name,
+                    error="No se pudo verificar el stock (botón de acción no encontrado)")
+
+        except Exception as exc:
+            logger.exception("Unexpected error for %s", url)
+            return StockResult(in_stock=None, name=None,
+                error=f"Error inesperado: {str(exc)[:120]}")
