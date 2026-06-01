@@ -35,6 +35,13 @@ def init_db():
                 UNIQUE(chat_id, url)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS credentials (
+                chat_id  INTEGER PRIMARY KEY,
+                email    TEXT NOT NULL,
+                password TEXT NOT NULL
+            )
+        """)
 
 
 def add_product(chat_id: int, url: str, name: str = None, selector: str = None) -> int:
@@ -82,3 +89,24 @@ def update_stock(product_id: int, in_stock: bool, name: str = None):
                 "UPDATE products SET in_stock = ?, last_checked = ? WHERE id = ?",
                 (1 if in_stock else 0, datetime.now().isoformat(), product_id),
             )
+
+
+def set_credentials(chat_id: int, email: str, password: str):
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO credentials (chat_id, email, password) VALUES (?, ?, ?)",
+            (chat_id, email, password),
+        )
+
+
+def get_credentials(chat_id: int):
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT email, password FROM credentials WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    return (row["email"], row["password"]) if row else None
+
+
+def delete_credentials(chat_id: int):
+    with _conn() as conn:
+        conn.execute("DELETE FROM credentials WHERE chat_id = ?", (chat_id,))
