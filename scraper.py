@@ -15,6 +15,12 @@ DUFRY_EMAIL = os.getenv("DUFRY_EMAIL")
 DUFRY_PASSWORD = os.getenv("DUFRY_PASSWORD")
 COOKIES_FILE = Path(os.getenv("COOKIES_FILE", "/tmp/dufry_session.json"))
 
+
+def _cookies_file(chat_id=None) -> Path:
+    if chat_id:
+        return Path(f"/tmp/dufry_session_{chat_id}.json")
+    return COOKIES_FILE
+
 SSO_LOGIN_URL = (
     "https://sso.clubavolta.com/login"
     "?response_type=code"
@@ -77,17 +83,19 @@ _NAME_SELECTORS = [
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
-async def _save_cookies(ctx):
+async def _save_cookies(ctx, chat_id=None):
+    path = _cookies_file(chat_id)
     cookies = await ctx.cookies()
-    COOKIES_FILE.write_text(json.dumps(cookies))
+    path.write_text(json.dumps(cookies))
     logger.info("Session saved (%d cookies)", len(cookies))
 
 
-async def _load_cookies(ctx) -> bool:
-    if not COOKIES_FILE.exists():
+async def _load_cookies(ctx, chat_id=None) -> bool:
+    path = _cookies_file(chat_id)
+    if not path.exists():
         return False
     try:
-        cookies = json.loads(COOKIES_FILE.read_text())
+        cookies = json.loads(path.read_text())
         await ctx.add_cookies(cookies)
         logger.info("Session loaded (%d cookies)", len(cookies))
         return True
@@ -142,9 +150,11 @@ async def _dismiss_cookie_banner(page):
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 
-async def _do_login(page) -> bool:
-    if not DUFRY_EMAIL or not DUFRY_PASSWORD:
-        logger.error("DUFRY_EMAIL / DUFRY_PASSWORD not configured")
+async def _do_login(page, email: str = None, password: str = None) -> bool:
+    email = email or DUFRY_EMAIL
+    password = password or DUFRY_PASSWORD
+    if not email or not password:
+        logger.error("No credentials available for login")
         return False
 
     try:
@@ -161,7 +171,7 @@ async def _do_login(page) -> bool:
             logger.error("No visible email field on SSO page")
             return False
 
-        await email_el.fill(DUFRY_EMAIL)
+        await email_el.fill(email)
         logger.info("Email filled")
 
         submit_btn = await _first_visible(page, ["button[type='submit']"])
@@ -184,7 +194,7 @@ async def _do_login(page) -> bool:
             logger.error("No visible password field")
             return False
 
-        await pass_el.fill(DUFRY_PASSWORD)
+        await pass_el.fill(password)
         logger.info("Password filled")
 
         await _dismiss_cookie_banner(page)
@@ -378,7 +388,9 @@ async def _verify_stock_by_clicking(page, product_url: str) -> Optional[bool]:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-async def check_stock(url: str, custom_selector: str = None) -> StockResult:
+async def check_stock(url: str, custom_selector: str = None,
+                      email: str = None, password: str = None,
+                      chat_id: int = None) -> StockResult:
     try:
         from playwright.async_api import async_playwright, TimeoutError as PWTimeout
     except ImportError:
@@ -407,7 +419,7 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                     timezone_id="Europe/Madrid",
                 )
                 page = await ctx.new_page()
-                await _load_cookies(ctx)
+                await _load_cookies(ctx, chat_id)
 
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=30_000)
@@ -423,12 +435,12 @@ async def check_stock(url: str, custom_selector: str = None) -> StockResult:
                 # Login if needed
                 if _needs_login(page.url):
                     logger.info("Login required")
-                    ok = await _do_login(page)
+                    ok = await _do_login(page, email, password)
                     if not ok:
                         await browser.close()
                         return StockResult(in_stock=None, name=None,
-                            error="Login fallido. Revisa DUFRY_EMAIL y DUFRY_PASSWORD.")
-                    await _save_cookies(ctx)
+                            error="Login fallido. Comprueba tus credenciales con /login.")
+                    await _save_cookies(ctx, chat_id)
                     try:
                         await page.goto(url, wait_until="networkidle", timeout=30_000)
                         logger.info("Back on product page: %s", page.url)
